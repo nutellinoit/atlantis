@@ -1,8 +1,10 @@
 package events_test
 
 import (
+	"fmt"
 	"io/ioutil"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	. "github.com/petergtz/pegomock"
@@ -180,7 +182,7 @@ func TestDefaultProjectCommandBuilder_BuildSinglePlanApplyCommand(t *testing.T) 
 				Workspace:  "myworkspace",
 			},
 			AtlantisYAML:   "",
-			ExpCommentArgs: []string{"commentarg"},
+			ExpCommentArgs: []string{`\c\o\m\m\e\n\t\a\r\g`},
 			ExpWorkspace:   "myworkspace",
 			ExpDir:         ".",
 			ExpApplyReqs:   []string{},
@@ -382,7 +384,7 @@ projects:
 				actCtx := actCtxs[0]
 				Equals(t, c.ExpDir, actCtx.RepoRelDir)
 				Equals(t, c.ExpWorkspace, actCtx.Workspace)
-				Equals(t, c.ExpCommentArgs, actCtx.CommentArgs)
+				Equals(t, c.ExpCommentArgs, actCtx.EscapedCommentArgs)
 				Equals(t, c.ExpProjectName, actCtx.ProjectName)
 				Equals(t, c.ExpApplyReqs, actCtx.ApplyRequirements)
 			})
@@ -653,4 +655,235 @@ projects:
 		ProjectName: "",
 	})
 	ErrEquals(t, "running commands in workspace \"notconfigured\" is not allowed because this directory is only configured for the following workspaces: default, staging", err)
+}
+
+// Test that extra comment args are escaped.
+func TestDefaultProjectCommandBuilder_EscapeArgs(t *testing.T) {
+	cases := []struct {
+		ExtraArgs      []string
+		ExpEscapedArgs []string
+	}{
+		{
+			ExtraArgs:      []string{"arg1", "arg2"},
+			ExpEscapedArgs: []string{`\a\r\g\1`, `\a\r\g\2`},
+		},
+		{
+			ExtraArgs:      []string{"-var=$(touch bad)"},
+			ExpEscapedArgs: []string{`\-\v\a\r\=\$\(\t\o\u\c\h\ \b\a\d\)`},
+		},
+		{
+			ExtraArgs:      []string{"-- ;echo bad"},
+			ExpEscapedArgs: []string{`\-\-\ \;\e\c\h\o\ \b\a\d`},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(strings.Join(c.ExtraArgs, " "), func(t *testing.T) {
+			RegisterMockTestingT(t)
+			tmpDir, cleanup := DirStructure(t, map[string]interface{}{
+				"main.tf": nil,
+			})
+			defer cleanup()
+
+			workingDir := mocks.NewMockWorkingDir()
+			When(workingDir.Clone(matchers.AnyPtrToLoggingSimpleLogger(), matchers.AnyModelsRepo(), matchers.AnyModelsRepo(), matchers.AnyModelsPullRequest(), AnyString())).ThenReturn(tmpDir, nil)
+			When(workingDir.GetWorkingDir(matchers.AnyModelsRepo(), matchers.AnyModelsPullRequest(), AnyString())).ThenReturn(tmpDir, nil)
+			vcsClient := vcsmocks.NewMockClient()
+			When(vcsClient.GetModifiedFiles(matchers.AnyModelsRepo(), matchers.AnyModelsPullRequest())).ThenReturn([]string{"main.tf"}, nil)
+
+			builder := &events.DefaultProjectCommandBuilder{
+				WorkingDirLocker: events.NewDefaultWorkingDirLocker(),
+				WorkingDir:       workingDir,
+				ParserValidator:  &yaml.ParserValidator{},
+				VCSClient:        vcsClient,
+				ProjectFinder:    &events.DefaultProjectFinder{},
+				CommentBuilder:   &events.CommentParser{},
+				GlobalCfg:        valid.NewGlobalCfg(true, false, false),
+			}
+
+			var actCtxs []models.ProjectCommandContext
+			var err error
+			actCtxs, err = builder.BuildPlanCommands(&events.CommandContext{}, &events.CommentCommand{
+				RepoRelDir: ".",
+				Flags:      c.ExtraArgs,
+				Name:       models.PlanCommand,
+				Verbose:    false,
+				Workspace:  "default",
+			})
+			Ok(t, err)
+			Equals(t, 1, len(actCtxs))
+			actCtx := actCtxs[0]
+			Equals(t, c.ExpEscapedArgs, actCtx.EscapedCommentArgs)
+		})
+	}
+}
+
+// Test that terraform version is used when specified in terraform configuration
+func TestDefaultProjectCommandBuilder_TerraformVersion(t *testing.T) {
+	// For the following tests:
+	// If terraform configuration is used, result should be `0.12.8`.
+	// If project configuration is used, result should be `0.12.6`.
+	// If default is to be used, result should be `nil`.
+	baseVersionConfig := `
+terraform {
+  required_version = "%s0.12.8"
+}
+`
+
+	atlantisYamlContent := `
+version: 3
+projects:
+- dir: project1 # project1 uses the defaults
+  terraform_version: v0.12.6
+`
+
+	exactSymbols := []string{"", "="}
+	nonExactSymbols := []string{">", ">=", "<", "<=", "~="}
+
+	type testCase struct {
+		DirStructure  map[string]interface{}
+		AtlantisYAML  string
+		ModifiedFiles []string
+		Exp           map[string][]int
+	}
+
+	testCases := make(map[string]testCase)
+
+	for _, exactSymbol := range exactSymbols {
+		testCases[fmt.Sprintf("exact version in terraform config using \"%s\"", exactSymbol)] = testCase{
+			DirStructure: map[string]interface{}{
+				"project1": map[string]interface{}{
+					"main.tf": fmt.Sprintf(baseVersionConfig, exactSymbol),
+				},
+			},
+			ModifiedFiles: []string{"project1/main.tf"},
+			Exp: map[string][]int{
+				"project1": {0, 12, 8},
+			},
+		}
+	}
+
+	for _, nonExactSymbol := range nonExactSymbols {
+		testCases[fmt.Sprintf("non-exact version in terraform config using \"%s\"", nonExactSymbol)] = testCase{
+			DirStructure: map[string]interface{}{
+				"project1": map[string]interface{}{
+					"main.tf": fmt.Sprintf(baseVersionConfig, nonExactSymbol),
+				},
+			},
+			ModifiedFiles: []string{"project1/main.tf"},
+			Exp: map[string][]int{
+				"project1": nil,
+			},
+		}
+	}
+
+	// atlantis.yaml should take precedence over terraform config
+	testCases["with project config and terraform config"] = testCase{
+		DirStructure: map[string]interface{}{
+			"project1": map[string]interface{}{
+				"main.tf": fmt.Sprintf(baseVersionConfig, exactSymbols[0]),
+			},
+			yaml.AtlantisYAMLFilename: atlantisYamlContent,
+		},
+		ModifiedFiles: []string{"project1/main.tf", "project2/main.tf"},
+		Exp: map[string][]int{
+			"project1": {0, 12, 6},
+		},
+	}
+
+	testCases["with project config only"] = testCase{
+		DirStructure: map[string]interface{}{
+			"project1": map[string]interface{}{
+				"main.tf": nil,
+			},
+			yaml.AtlantisYAMLFilename: atlantisYamlContent,
+		},
+		ModifiedFiles: []string{"project1/main.tf"},
+		Exp: map[string][]int{
+			"project1": {0, 12, 6},
+		},
+	}
+
+	testCases["neither project config or terraform config"] = testCase{
+		DirStructure: map[string]interface{}{
+			"project1": map[string]interface{}{
+				"main.tf": nil,
+			},
+		},
+		ModifiedFiles: []string{"project1/main.tf", "project2/main.tf"},
+		Exp: map[string][]int{
+			"project1": nil,
+		},
+	}
+
+	testCases["project with different terraform config"] = testCase{
+		DirStructure: map[string]interface{}{
+			"project1": map[string]interface{}{
+				"main.tf": fmt.Sprintf(baseVersionConfig, exactSymbols[0]),
+			},
+			"project2": map[string]interface{}{
+				"main.tf": strings.Replace(fmt.Sprintf(baseVersionConfig, exactSymbols[0]), "0.12.8", "0.12.9", -1),
+			},
+		},
+		ModifiedFiles: []string{"project1/main.tf", "project2/main.tf"},
+		Exp: map[string][]int{
+			"project1": {0, 12, 8},
+			"project2": {0, 12, 9},
+		},
+	}
+
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			RegisterMockTestingT(t)
+
+			tmpDir, cleanup := DirStructure(t, testCase.DirStructure)
+
+			defer cleanup()
+			vcsClient := vcsmocks.NewMockClient()
+			When(vcsClient.GetModifiedFiles(matchers.AnyModelsRepo(), matchers.AnyModelsPullRequest())).ThenReturn(testCase.ModifiedFiles, nil)
+
+			workingDir := mocks.NewMockWorkingDir()
+			When(workingDir.Clone(
+				matchers.AnyPtrToLoggingSimpleLogger(),
+				matchers.AnyModelsRepo(),
+				matchers.AnyModelsRepo(),
+				matchers.AnyModelsPullRequest(),
+				AnyString())).ThenReturn(tmpDir, nil)
+
+			When(workingDir.GetWorkingDir(
+				matchers.AnyModelsRepo(),
+				matchers.AnyModelsPullRequest(),
+				AnyString())).ThenReturn(tmpDir, nil)
+
+			builder := &events.DefaultProjectCommandBuilder{
+				WorkingDirLocker: events.NewDefaultWorkingDirLocker(),
+				WorkingDir:       workingDir,
+				VCSClient:        vcsClient,
+				ParserValidator:  &yaml.ParserValidator{},
+				ProjectFinder:    &events.DefaultProjectFinder{},
+				CommentBuilder:   &events.CommentParser{},
+				GlobalCfg:        valid.NewGlobalCfg(true, false, false),
+			}
+
+			actCtxs, err := builder.BuildPlanCommands(
+				&events.CommandContext{},
+				&events.CommentCommand{
+					RepoRelDir: "",
+					Flags:      nil,
+					Name:       models.PlanCommand,
+					Verbose:    false,
+				})
+
+			Ok(t, err)
+			Equals(t, len(testCase.Exp), len(actCtxs))
+			for _, actCtx := range actCtxs {
+				if testCase.Exp[actCtx.RepoRelDir] != nil {
+					Assert(t, actCtx.TerraformVersion != nil, "TerraformVersion is nil.")
+					Equals(t, testCase.Exp[actCtx.RepoRelDir], actCtx.TerraformVersion.Segments())
+				} else {
+					Assert(t, actCtx.TerraformVersion == nil, "TerraformVersion is supposed to be nil.")
+				}
+			}
+		})
+	}
 }

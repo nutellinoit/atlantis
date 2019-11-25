@@ -25,10 +25,12 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/mitchellh/go-homedir"
 	"github.com/runatlantis/atlantis/server/events/db"
 	"github.com/runatlantis/atlantis/server/events/yaml/valid"
 
@@ -113,6 +115,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	var gitlabClient *vcs.GitlabClient
 	var bitbucketCloudClient *bitbucketcloud.Client
 	var bitbucketServerClient *bitbucketserver.Client
+	var azuredevopsClient *vcs.AzureDevopsClient
 	if userConfig.GithubUser != "" {
 		supportedVCSHosts = append(supportedVCSHosts, models.Github)
 		var err error
@@ -151,6 +154,41 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 			}
 		}
 	}
+	if userConfig.AzureDevopsUser != "" {
+		supportedVCSHosts = append(supportedVCSHosts, models.AzureDevops)
+		var err error
+		azuredevopsClient, err = vcs.NewAzureDevopsClient("dev.azure.com", userConfig.AzureDevopsToken)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if userConfig.WriteGitCreds {
+		home, err := homedir.Dir()
+		if err != nil {
+			return nil, errors.Wrap(err, "getting home dir to write ~/.git-credentials file")
+		}
+		if userConfig.GithubUser != "" {
+			if err := events.WriteGitCreds(userConfig.GithubUser, userConfig.GithubToken, userConfig.GithubHostname, home, logger); err != nil {
+				return nil, err
+			}
+		}
+		if userConfig.GitlabUser != "" {
+			if err := events.WriteGitCreds(userConfig.GitlabUser, userConfig.GitlabToken, userConfig.GitlabHostname, home, logger); err != nil {
+				return nil, err
+			}
+		}
+		if userConfig.BitbucketUser != "" {
+			if err := events.WriteGitCreds(userConfig.BitbucketUser, userConfig.BitbucketToken, userConfig.BitbucketBaseURL, home, logger); err != nil {
+				return nil, err
+			}
+		}
+		if userConfig.AzureDevopsUser != "" {
+			if err := events.WriteGitCreds(userConfig.AzureDevopsUser, userConfig.AzureDevopsToken, "https://dev.azure.com/", home, logger); err != nil {
+				return nil, err
+			}
+		}
+	}
 
 	var webhooksConfig []webhooks.Config
 	for _, c := range userConfig.Webhooks {
@@ -166,9 +204,16 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "initializing webhooks")
 	}
-	vcsClient := vcs.NewClientProxy(githubClient, gitlabClient, bitbucketCloudClient, bitbucketServerClient)
+	vcsClient := vcs.NewClientProxy(githubClient, gitlabClient, bitbucketCloudClient, bitbucketServerClient, azuredevopsClient)
 	commitStatusUpdater := &events.DefaultCommitStatusUpdater{Client: vcsClient}
-	terraformClient, err := terraform.NewClient(logger, userConfig.DataDir, userConfig.TFEToken, userConfig.DefaultTFVersion, config.DefaultTFVersionFlag, &terraform.DefaultDownloader{})
+	terraformClient, err := terraform.NewClient(
+		logger,
+		userConfig.DataDir,
+		userConfig.TFEToken,
+		userConfig.TFEHostname,
+		userConfig.DefaultTFVersion,
+		config.DefaultTFVersionFlag,
+		&terraform.DefaultDownloader{})
 	// The flag.Lookup call is to detect if we're running in a unit test. If we
 	// are, then we don't error out because we don't have/want terraform
 	// installed on our CI system where the unit tests run.
@@ -234,18 +279,27 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		BitbucketUser:      userConfig.BitbucketUser,
 		BitbucketToken:     userConfig.BitbucketToken,
 		BitbucketServerURL: userConfig.BitbucketBaseURL,
+		AzureDevopsUser:    userConfig.AzureDevopsUser,
+		AzureDevopsToken:   userConfig.AzureDevopsToken,
 	}
 	commentParser := &events.CommentParser{
-		GithubUser:    userConfig.GithubUser,
-		GitlabUser:    userConfig.GitlabUser,
-		BitbucketUser: userConfig.BitbucketUser,
+		GithubUser:      userConfig.GithubUser,
+		GitlabUser:      userConfig.GitlabUser,
+		BitbucketUser:   userConfig.BitbucketUser,
+		AzureDevopsUser: userConfig.AzureDevopsUser,
 	}
 	defaultTfVersion := terraformClient.DefaultVersion()
 	pendingPlanFinder := &events.DefaultPendingPlanFinder{}
+	runStepRunner := &runtime.RunStepRunner{
+		TerraformExecutor: terraformClient,
+		DefaultTFVersion:  defaultTfVersion,
+		TerraformBinDir:   terraformClient.TerraformBinDir(),
+	}
 	commandRunner := &events.DefaultCommandRunner{
 		VCSClient:                vcsClient,
 		GithubPullGetter:         githubClient,
 		GitlabMergeRequestGetter: gitlabClient,
+		AzureDevopsPullGetter:    azuredevopsClient,
 		CommitStatusUpdater:      commitStatusUpdater,
 		EventParser:              eventParser,
 		MarkdownRenderer:         markdownRenderer,
@@ -281,8 +335,9 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 				CommitStatusUpdater: commitStatusUpdater,
 				AsyncTFExec:         terraformClient,
 			},
-			RunStepRunner: &runtime.RunStepRunner{
-				DefaultTFVersion: defaultTfVersion,
+			RunStepRunner: runStepRunner,
+			EnvStepRunner: &runtime.EnvStepRunner{
+				RunStepRunner: runStepRunner,
 			},
 			PullApprovedChecker: vcsClient,
 			WorkingDir:          workingDir,
@@ -310,20 +365,23 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		DB:                 boltdb,
 	}
 	eventsController := &EventsController{
-		CommandRunner:                commandRunner,
-		PullCleaner:                  pullClosedExecutor,
-		Parser:                       eventParser,
-		CommentParser:                commentParser,
-		Logger:                       logger,
-		GithubWebhookSecret:          []byte(userConfig.GithubWebhookSecret),
-		GithubRequestValidator:       &DefaultGithubRequestValidator{},
-		GitlabRequestParserValidator: &DefaultGitlabRequestParserValidator{},
-		GitlabWebhookSecret:          []byte(userConfig.GitlabWebhookSecret),
-		RepoWhitelistChecker:         repoWhitelist,
-		SilenceWhitelistErrors:       userConfig.SilenceWhitelistErrors,
-		SupportedVCSHosts:            supportedVCSHosts,
-		VCSClient:                    vcsClient,
-		BitbucketWebhookSecret:       []byte(userConfig.BitbucketWebhookSecret),
+		CommandRunner:                   commandRunner,
+		PullCleaner:                     pullClosedExecutor,
+		Parser:                          eventParser,
+		CommentParser:                   commentParser,
+		Logger:                          logger,
+		GithubWebhookSecret:             []byte(userConfig.GithubWebhookSecret),
+		GithubRequestValidator:          &DefaultGithubRequestValidator{},
+		GitlabRequestParserValidator:    &DefaultGitlabRequestParserValidator{},
+		GitlabWebhookSecret:             []byte(userConfig.GitlabWebhookSecret),
+		RepoWhitelistChecker:            repoWhitelist,
+		SilenceWhitelistErrors:          userConfig.SilenceWhitelistErrors,
+		SupportedVCSHosts:               supportedVCSHosts,
+		VCSClient:                       vcsClient,
+		BitbucketWebhookSecret:          []byte(userConfig.BitbucketWebhookSecret),
+		AzureDevopsWebhookBasicUser:     []byte(userConfig.AzureDevopsWebhookUser),
+		AzureDevopsWebhookBasicPassword: []byte(userConfig.AzureDevopsWebhookPassword),
+		AzureDevopsRequestValidator:     &DefaultAzureDevopsRequestValidator{},
 	}
 	return &Server{
 		AtlantisVersion:    config.AtlantisVersion,
@@ -406,12 +464,19 @@ func (s *Server) Index(w http.ResponseWriter, _ *http.Request) {
 		lockResults = append(lockResults, LockIndexData{
 			// NOTE: must use .String() instead of .Path because we need the
 			// query params as part of the lock URL.
-			LockPath:     lockURL.String(),
-			RepoFullName: v.Project.RepoFullName,
-			PullNum:      v.Pull.Num,
-			Time:         v.Time,
+			LockPath:      lockURL.String(),
+			RepoFullName:  v.Project.RepoFullName,
+			PullNum:       v.Pull.Num,
+			Path:          v.Project.Path,
+			Workspace:     v.Workspace,
+			Time:          v.Time,
+			TimeFormatted: v.Time.Format("02-01-2006 15:04:05"),
 		})
 	}
+
+	//Sort by date - newest to oldest.
+	sort.SliceStable(lockResults, func(i, j int) bool { return lockResults[i].Time.After(lockResults[j].Time) })
+
 	err = s.IndexTemplate.Execute(w, IndexData{
 		Locks:           lockResults,
 		AtlantisVersion: s.AtlantisVersion,

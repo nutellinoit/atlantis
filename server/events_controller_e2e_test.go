@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/google/go-github/github"
+	"github.com/google/go-github/v28/github"
 	"github.com/hashicorp/go-getter"
 	"github.com/hashicorp/go-version"
 	. "github.com/petergtz/pegomock"
@@ -400,7 +400,7 @@ func setupE2E(t *testing.T, repoDir string) (server.EventsController, *vcsmocks.
 		GithubUser: "github-user",
 		GitlabUser: "gitlab-user",
 	}
-	terraformClient, err := terraform.NewClient(logger, dataDir, "", "", "default-tf-version", &NoopTFDownloader{})
+	terraformClient, err := terraform.NewClient(logger, dataDir, "", "", "", "default-tf-version", &NoopTFDownloader{})
 	Ok(t, err)
 	boltdb, err := db.New(dataDir)
 	Ok(t, err)
@@ -438,7 +438,8 @@ func setupE2E(t *testing.T, repoDir string) (server.EventsController, *vcsmocks.
 				TerraformExecutor: terraformClient,
 			},
 			RunStepRunner: &runtime.RunStepRunner{
-				DefaultTFVersion: defaultTFVersion,
+				TerraformExecutor: terraformClient,
+				DefaultTFVersion:  defaultTFVersion,
 			},
 			PullApprovedChecker: e2eVCSClient,
 			WorkingDir:          workingDir,

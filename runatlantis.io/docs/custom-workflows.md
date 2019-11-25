@@ -136,21 +136,43 @@ Atlantis supports running custom commands in place of the default Atlantis
 commands. We can use this functionality to enable
 [Terragrunt](https://github.com/gruntwork-io/terragrunt).
 
+You can either use your repo's `atlantis.yaml` file or the Atlantis server's `repos.yaml` file.
+
 Given a directory structure:
 ```
 .
-├── live
-│   ├── prod
-│   │   └── terraform.tfvars
-│   └── staging
-│       └── terraform.tfvars
-└── modules
-    └── ...
+└── live
+    ├── prod
+    │   └── terragrunt.hcl
+    └── staging
+        └── terragrunt.cl
 ```
 
-You would define a custom workflow:
+If using the server `repos.yaml` file, you would use the following config:
+
 ```yaml
-# repos.yaml or atlantis.yaml
+# repos.yaml
+repos:
+- id: "/.*/"
+  workflow: terragrunt
+workflows:
+  terragrunt:
+    plan:
+      steps:
+      - run: terragrunt plan -no-color -out=$PLANFILE
+    apply:
+      steps:
+      - run: terragrunt apply -no-color $PLANFILE
+```
+
+If using the repo's `atlantis.yaml` file you would use the following config:
+```yaml
+version: 3
+projects:
+- dir: live/staging
+  workflow: terragrunt
+- dir: live/prod
+  workflow: terragrunt
 workflows:
   terragrunt:
     plan:
@@ -161,15 +183,8 @@ workflows:
       - run: terragrunt apply -no-color $PLANFILE
 ```
 
-Which you would then reference in your repo-level `atlantis.yaml`:
-```yaml
-version: 3
-projects:
-- dir: live/staging
-  workflow: terragrunt
-- dir: live/prod
-  workflow: terragrunt
-```
+**NOTE:** If using the repo's `atlantis.yaml` file, you will need to specify each directory that is a Terragrunt project.
+
 
 ::: warning
 Atlantis will need to have the `terragrunt` binary in its PATH.
@@ -322,6 +337,8 @@ Or a custom command
   * `PULL_NUM` - Pull request number or ID, ex. `2`.
   * `PULL_AUTHOR` - Username of the pull request author, ex. `acme-user`.
   * `USER_NAME` - Username of the VCS user running command, ex. `acme-user`. During an autoplan, the user will be the Atlantis API user, ex. `atlantis`.
+  * `COMMENT_ARGS` - Any additional flags passed in the comment on the pull request. Flags are separated by commas and
+  every character is escaped, ex. `atlantis plan -- arg1 arg2` will result in `COMMENT_ARGS=\a\r\g\1,\a\r\g\2`.
 * A custom command will only terminate if all output file descriptors are closed.
 Therefore a custom command can only be sent to the background (e.g. for an SSH tunnel during
 the terraform run) when its output is redirected to a different location. For example, Atlantis

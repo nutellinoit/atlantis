@@ -2,10 +2,14 @@ package events
 
 import (
 	"fmt"
+	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/runatlantis/atlantis/server/events/yaml/valid"
 
+	"github.com/hashicorp/go-version"
+	"github.com/hashicorp/terraform-config-inspect/tfconfig"
 	"github.com/pkg/errors"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/events/vcs"
@@ -137,7 +141,7 @@ func (p *DefaultProjectCommandBuilder) buildPlanAllCommands(ctx *CommandContext,
 		for _, mp := range matchingProjects {
 			ctx.Log.Debug("determining config for project at dir: %q workspace: %q", mp.Dir, mp.Workspace)
 			mergedCfg := p.GlobalCfg.MergeProjectCfg(ctx.Log, ctx.BaseRepo.ID(), mp, repoCfg)
-			projCtxs = append(projCtxs, p.buildCtx(ctx, models.PlanCommand, mergedCfg, commentFlags, repoCfg.Automerge, verbose))
+			projCtxs = append(projCtxs, p.buildCtx(ctx, models.PlanCommand, mergedCfg, commentFlags, repoCfg.Automerge, verbose, repoDir))
 		}
 	} else {
 		// If there is no config file, then we'll plan each project that
@@ -148,7 +152,7 @@ func (p *DefaultProjectCommandBuilder) buildPlanAllCommands(ctx *CommandContext,
 		for _, mp := range modifiedProjects {
 			ctx.Log.Debug("determining config for project at dir: %q", mp.Path)
 			pCfg := p.GlobalCfg.DefaultProjCfg(ctx.Log, ctx.BaseRepo.ID(), mp.Path, DefaultWorkspace)
-			projCtxs = append(projCtxs, p.buildCtx(ctx, models.PlanCommand, pCfg, commentFlags, DefaultAutomergeEnabled, verbose))
+			projCtxs = append(projCtxs, p.buildCtx(ctx, models.PlanCommand, pCfg, commentFlags, DefaultAutomergeEnabled, verbose, repoDir))
 		}
 	}
 
@@ -282,7 +286,7 @@ func (p *DefaultProjectCommandBuilder) buildProjectCommandCtx(
 	if repoCfgPtr != nil {
 		automerge = repoCfgPtr.Automerge
 	}
-	return p.buildCtx(ctx, cmd, projCfg, commentFlags, automerge, verbose), nil
+	return p.buildCtx(ctx, cmd, projCfg, commentFlags, automerge, verbose, repoDir), nil
 }
 
 // getCfg returns the atlantis.yaml config (if it exists) for this project. If
@@ -371,7 +375,8 @@ func (p *DefaultProjectCommandBuilder) buildCtx(ctx *CommandContext,
 	projCfg valid.MergedProjectCfg,
 	commentArgs []string,
 	automergeEnabled bool,
-	verbose bool) models.ProjectCommandContext {
+	verbose bool,
+	absRepoDir string) models.ProjectCommandContext {
 
 	var steps []valid.Step
 	switch cmd {
@@ -381,25 +386,76 @@ func (p *DefaultProjectCommandBuilder) buildCtx(ctx *CommandContext,
 		steps = projCfg.Workflow.Apply.Steps
 	}
 
-	return models.ProjectCommandContext{
-		ApplyCmd:          p.CommentBuilder.BuildApplyComment(projCfg.RepoRelDir, projCfg.Workspace, projCfg.Name),
-		BaseRepo:          ctx.BaseRepo,
-		CommentArgs:       commentArgs,
-		AutomergeEnabled:  automergeEnabled,
-		AutoplanEnabled:   projCfg.AutoplanEnabled,
-		Steps:             steps,
-		HeadRepo:          ctx.HeadRepo,
-		Log:               ctx.Log,
-		PullMergeable:     ctx.PullMergeable,
-		Pull:              ctx.Pull,
-		ProjectName:       projCfg.Name,
-		ApplyRequirements: projCfg.ApplyRequirements,
-		RePlanCmd:         p.CommentBuilder.BuildPlanComment(projCfg.RepoRelDir, projCfg.Workspace, projCfg.Name, commentArgs),
-		RepoRelDir:        projCfg.RepoRelDir,
-		RepoConfigVersion: projCfg.RepoCfgVersion,
-		TerraformVersion:  projCfg.TerraformVersion,
-		User:              ctx.User,
-		Verbose:           verbose,
-		Workspace:         projCfg.Workspace,
+	// If TerraformVersion not defined in config file look for a
+	// terraform.require_version block.
+	if projCfg.TerraformVersion == nil {
+		projCfg.TerraformVersion = p.getTfVersion(ctx, filepath.Join(absRepoDir, projCfg.RepoRelDir))
 	}
+
+	return models.ProjectCommandContext{
+		ApplyCmd:           p.CommentBuilder.BuildApplyComment(projCfg.RepoRelDir, projCfg.Workspace, projCfg.Name),
+		BaseRepo:           ctx.BaseRepo,
+		EscapedCommentArgs: p.escapeArgs(commentArgs),
+		AutomergeEnabled:   automergeEnabled,
+		AutoplanEnabled:    projCfg.AutoplanEnabled,
+		Steps:              steps,
+		HeadRepo:           ctx.HeadRepo,
+		Log:                ctx.Log,
+		PullMergeable:      ctx.PullMergeable,
+		Pull:               ctx.Pull,
+		ProjectName:        projCfg.Name,
+		ApplyRequirements:  projCfg.ApplyRequirements,
+		RePlanCmd:          p.CommentBuilder.BuildPlanComment(projCfg.RepoRelDir, projCfg.Workspace, projCfg.Name, commentArgs),
+		RepoRelDir:         projCfg.RepoRelDir,
+		RepoConfigVersion:  projCfg.RepoCfgVersion,
+		TerraformVersion:   projCfg.TerraformVersion,
+		User:               ctx.User,
+		Verbose:            verbose,
+		Workspace:          projCfg.Workspace,
+	}
+}
+
+func (p *DefaultProjectCommandBuilder) escapeArgs(args []string) []string {
+	var escaped []string
+	for _, arg := range args {
+		var escapedArg string
+		for i := range arg {
+			escapedArg += "\\" + string(arg[i])
+		}
+		escaped = append(escaped, escapedArg)
+	}
+	return escaped
+}
+
+// Extracts required_version from Terraform configuration.
+// Returns nil if unable to determine version from configuration.
+func (p *DefaultProjectCommandBuilder) getTfVersion(ctx *CommandContext, absProjDir string) *version.Version {
+	module, diags := tfconfig.LoadModule(absProjDir)
+	if diags.HasErrors() {
+		ctx.Log.Err("trying to detect required version: %s", diags.Error())
+		return nil
+	}
+
+	if len(module.RequiredCore) != 1 {
+		ctx.Log.Info("cannot determine which version to use from terraform configuration, detected %d possibilities.", len(module.RequiredCore))
+		return nil
+	}
+	requiredVersionSetting := module.RequiredCore[0]
+
+	// We allow `= x.y.z`, `=x.y.z` or `x.y.z` where `x`, `y` and `z` are integers.
+	re := regexp.MustCompile(`^=?\s*([^\s]+)\s*$`)
+	matched := re.FindStringSubmatch(requiredVersionSetting)
+	if len(matched) == 0 {
+		ctx.Log.Debug("did not specify exact version in terraform configuration, found %q", requiredVersionSetting)
+		return nil
+	}
+	ctx.Log.Debug("found required_version setting of %q", requiredVersionSetting)
+	version, err := version.NewVersion(matched[1])
+	if err != nil {
+		ctx.Log.Debug(err.Error())
+		return nil
+	}
+
+	ctx.Log.Info("detected module requires version: %q", version.String())
+	return version
 }

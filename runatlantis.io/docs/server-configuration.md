@@ -98,6 +98,38 @@ Values are chosen in this order:
   Automatically merge pull requests after all plans have been successfully applied.
   Defaults to `false`. See [Automerging](automerging.html) for more details.
 
+* ### `--azuredevops-webhook-password`
+  ```bash
+  atlantis server --azuredevops-webhook-password="password123"
+  ```
+  Azure DevOps basic authentication password for inbound webhooks (see
+  https://docs.microsoft.com/en-us/azure/devops/service-hooks/authorize?view=azure-devops).
+  SECURITY WARNING: If not specified, Atlantis won't be able to validate that the
+  incoming webhook call came from your Azure DevOps org. This means that an
+  attacker could spoof calls to Atlantis and cause it to perform malicious
+  actions. Should be specified via the ATLANTIS_AZUREDEVOPS_BASIC_AUTH environment
+  variable.
+
+* ### `--azuredevops-webhook-user`
+  ```bash
+  atlantis server --azuredevops-webhook-user="username@example.com"
+  ```
+  Azure DevOps basic authentication username for inbound webhooks. Can also be specified via the ATLANTIS_AZUREDEVOPS_WEBHOOK_USER
+  environment variable.
+
+* ### `--azuredevops-token`
+  ```bash
+  atlantis server --azuredevops-token="username@example.com"
+  ```
+  Azure DevOps token of API user. Can also be specified via the ATLANTIS_AZUREDEVOPS_TOKEN
+  environment variable.
+
+* ### `--azuredevops-user`
+  ```bash
+  atlantis server --azuredevops-user="username@example.com"
+  ```
+  Azure DevOps username of API user.
+
 * ### `--bitbucket-base-url`
   ```bash
   atlantis server --bitbucket-base-url="http://bitbucket.corp:7990/basepath"
@@ -308,6 +340,8 @@ Values are chosen in this order:
   * Format is `{hostname}/{owner}/{repo}`, ex. `github.com/runatlantis/atlantis`
   * `*` matches any characters, ex. `github.com/runatlantis/*` will match all repos in the runatlantis organization
   * For Bitbucket Server: `{hostname}` is the domain without scheme and port, `{owner}` is the name of the project (not the key), and `{repo}` is the repo name
+  * For Azure DevOps the whitelist takes one of two forms: `{owner}.visualstudio.com/{project}/{repo}` or `dev.azure.com/{owner}/{project}/{repo}
+  * Microsoft is in the process of changing Azure DevOps to the latter form, so it may be safest to always specify both formats in your repo whitelist for each repository until the change is complete.
 
   Examples:
   * Whitelist `myorg/repo1` and `myorg/repo2` on `github.com`
@@ -316,6 +350,8 @@ Values are chosen in this order:
     * `--repo-whitelist='github.com/myorg/*'`
   * Whitelist all repos in my GitHub Enterprise installation
     * `--repo-whitelist='github.yourcompany.com/*'`
+  * Whitelist all repos under `myorg` project `myproject` on Azure DevOps
+    * `--repo-whitelist='myorg.visualstudio.com/myproject/*,dev.azure.com/myorg/myproject/*'`
   * Whitelist all repositories
     * `--repo-whitelist='*'`
 
@@ -385,6 +421,15 @@ Values are chosen in this order:
   atlantis server --ssl-cert-file="/etc/ssl/private/my-cert.key"
   ```
   File containing x509 private key matching `--ssl-cert-file`.
+ 
+* ### `--tfe-hostname`
+  ```bash
+  atlantis server --tfe-hostname="my-terraform-enterprise.company.com"
+  ```
+  Hostname of your Terraform Enterprise installation to be used in conjunction with
+  `--tfe-token`. See [Terraform Cloud](terraform-cloud.html) for more details.
+  If using Terraform Cloud (i.e. you don't have your own Terraform Enterprise installation)
+  no need to set since it defaults to `app.terraform.io`.
 
 * ### `--tfe-token`
   ```bash
@@ -393,3 +438,13 @@ Values are chosen in this order:
   ATLANTIS_TFE_TOKEN='xxx.atlasv1.yyy' atlantis server
   ```
   A token for Terraform Cloud/Terraform Enteprise integration. See [Terraform Cloud](terraform-cloud.html) for more details.
+
+* ### `--write-git-creds`
+  ```bash
+  atlantis server --write-git-creds
+  ```
+  Write out a .git-credentials file with the provider user and token to allow
+  cloning private modules over HTTPS or SSH. See [here](https://git-scm.com/docs/git-credential-store) for more information.
+  ::: warning SECURITY WARNING
+  This does write secrets to disk and should only be enabled in a secure environment.
+  :::
